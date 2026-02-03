@@ -1,11 +1,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::path::{Path};
+use std::path::{Path, PathBuf};
 use crate::entry::{Entry};
 use crate::memtable::{MemTable};
 use crate::types::{Encode, Decode, DBError};
 use crate::sstable::{SSTableMeta, SSTableReader};
+use crate::wal::{WAL, SyncPolicy, WALRecord, Op};
 
 mod memtable;
 mod entry;
@@ -20,26 +21,30 @@ const DEFAULT_SS_L0_COMPACT_THRESHOLD: u32 = 100;
 
 /// The DBOpts used to configure the LSMDB
 /// TODO: We can use the builder pattern here
-pub struct DBOpts {
+pub struct DBConfig {
     // The max size in terms of capacity ie number of objects the MemTable will hold prior to SSTable write
     // `u32` is tentative
     pub memtable_max_size: Option<u32>,
-    pub ss_table_path: Option<String>,
-    pub wal_path: Option<String>,
+    pub ss_table_dir: PathBuf,
+    pub wal_file: PathBuf,
+    pub wal_sync_policy: SyncPolicy,
     pub ss_l0_compact_threshold: u32,
 }
 
-impl Default for DBOpts {
+impl Default for DBConfig {
     fn default() -> Self {
-        let ss_table_path = Path::new(DEFAULT_SS_TABLE_DIR);
-        let wal_path = Path::new(DEFAULT_WAL_DIR);
-        let ss_num_files_before_compaction = DEFAULT_SS_L0_COMPACT_THRESHOLD;
-
+        let mut ss_table_path = PathBuf::new();
+        ss_table_path.push(DEFAULT_SS_TABLE_DIR);
+        
+        let mut wal_path = PathBuf::new();
+        wal_path.push(DEFAULT_WAL_DIR);
+        
         Self {
             memtable_max_size: Some(100),
-            ss_table_path: Some(DEFAULT_SS_TABLE_DIR.to_string()),
-            wal_path: Some(DEFAULT_WAL_DIR.to_string()),
-            ss_l0_compact_threshold: ss_num_files_before_compaction,
+            ss_table_dir: ss_table_path,
+            wal_file: wal_path,
+            ss_l0_compact_threshold: DEFAULT_SS_L0_COMPACT_THRESHOLD,
+            wal_sync_policy: SyncPolicy::Always,
         }
     }
 }
@@ -54,28 +59,31 @@ pub struct DB {
     ss_meta: Vec<SSTableMeta>,
     ss_reader: Option<SSTableReader>,
     // manifest: Option<Manifest>,
-    // wal: Option<WAL>,
-    opts: DBOpts,
+    wal: wal::WAL,
+    opts: DBConfig,
     next_seq_no: u64,
 }
 
 impl DB {
-    pub fn new(opts: Option<DBOpts>) -> Self {
+    pub fn new(opts: Option<DBConfig>) -> Result<Self, DBError> {
         let opt = if let Some(opt) = opts {
             opt
         } else {
-            DBOpts::default()
+            DBConfig::default()
         };
+        
+        let wal_path_buf = PathBuf::from(opt.wal_file.clone());
+        let wal = WAL::new(wal_path_buf,opt.wal_sync_policy)?;
 
-        Self {
+        Ok(Self {
             mt: BTreeMap::new(),
             ss_meta: vec![],
             ss_reader: None,
             // manifest: None,
-            // wal: None,
+            wal: wal,
             opts: opt,
             next_seq_no: 0,
-        }
+        })
     }
 
     /// Put will attempt to add the new K, V pair. In the event a key match takes place, if the new value
@@ -87,7 +95,13 @@ impl DB {
     pub fn put<K: Encode, V: Encode>(&mut self, key: &K, val: &V) -> Result<(), DBError> {
         let encoded_key = key.encode();
         let encoded_val = val.encode();
+        
+        // Insert into WAL
+        // TODO: see if we can prevent multiple clones
+        let wal_record = WALRecord::new(Op::Put, self.next_seq_no, encoded_key.clone(), encoded_val.clone());
+        self.wal.append(&wal_record)?;
 
+        // Insert into MemTable
         memtable::put(&mut self.mt, encoded_key, encoded_val, self.next_seq_no)?;
 
         self.next_seq_no += 1;
@@ -139,7 +153,12 @@ impl DB {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use std::fs::{OpenOptions};
+    
+    const TEST_DATA_DIR: &'static str = "test_data";
+    const SS_TABLE_DIR: &'static str = "sstb";
+    const WAL_DIR: &'static str = "wal";
+    
     type TestEncoder = String;
     impl Encode for TestEncoder {
         fn encode(&self) -> Vec<u8> {
@@ -158,10 +177,39 @@ mod tests {
             }
         }
     }
+    
+    fn test_default_config (wal_file_name: &str) -> DBConfig {
+        let mut ss_table_path = PathBuf::new();
+        ss_table_path.push(TEST_DATA_DIR);
+        ss_table_path.push(SS_TABLE_DIR);
+        
+        let mut wal_path = PathBuf::new();
+        wal_path.push(TEST_DATA_DIR);
+        wal_path.push(WAL_DIR);
+        wal_path.push(format!("{}_wal.wl", wal_file_name));
+        
+        // println!("wal_path: {:?}", wal_path);
+ 
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(wal_path.clone())
+            .unwrap();
+        
+        DBConfig {
+            memtable_max_size: Some(1000),
+            ss_table_dir: ss_table_path,
+            wal_file: wal_path,
+            wal_sync_policy: SyncPolicy::Always,
+            ss_l0_compact_threshold: 1000
+        }
+    }
 
     #[test]
     fn insert_and_get() {
-        let mut db = DB::new(None);
+        let mut db = DB::new(Some(test_default_config("insert_and_get"))).unwrap();
 
         let key: TestEncoder = "key-1".to_string();
         let val: TestEncoder = "some-val".to_string();
@@ -211,7 +259,7 @@ mod tests {
 
     #[test]
     fn insert_empty_key() {
-        let mut db = DB::new(None);
+        let mut db = DB::new(Some(test_default_config("insert_empty_key"))).unwrap();
 
         let key: TestEncoder = "".to_string();
         let val: TestEncoder = "s1".to_string();
@@ -223,7 +271,7 @@ mod tests {
 
     #[test]
     fn insert_duplicate_and_get() {
-        let mut db = DB::new(None);
+        let mut db = DB::new(Some(test_default_config("insert_duplicate_and_get"))).unwrap();
 
         let key: TestEncoder = "k1".to_string();
         let val: TestEncoder = "s1".to_string();

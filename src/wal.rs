@@ -4,14 +4,15 @@ use std::path::PathBuf;
 
 use crate::types::DBError;
 
-enum SyncPolicy {
+#[derive(Debug, Clone, Copy)]
+pub enum SyncPolicy {
     Always,
     Never,
 }
 
 /// The WAL (Write-Ahead-Log) acts as a persistent store for incoming changes for the MemTable. It acts as a durability layer that accepts append-only writes
 /// that go to file, and only then are then added to the MemTable
-struct WAL {
+pub struct WAL {
     buf: BufWriter<File>,
     pathBuf: PathBuf,
     sync: SyncPolicy,
@@ -74,11 +75,22 @@ impl WAL {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WALRecord {
+pub struct WALRecord {
     op: Op,
     seq_no: u64,
     key: Vec<u8>,
     val: Vec<u8>,
+}
+
+impl WALRecord {
+    pub fn new(op: Op, seq_no: u64, key: Vec<u8>, val: Vec<u8>) -> Self {
+        Self {
+            op,
+            seq_no,
+            key,
+            val,
+        }
+    }
 }
 
 #[derive(Debug)]
