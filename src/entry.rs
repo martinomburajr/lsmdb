@@ -7,7 +7,7 @@ pub enum Entry {
 impl Entry {
     pub fn seq_no(&self) -> u64 {
         match self {
-            Entry::Value { seq_no, val } => *seq_no,
+            Entry::Value { seq_no, .. } => *seq_no,
             Entry::Tombstone { seq_no } => *seq_no,
         }
     }

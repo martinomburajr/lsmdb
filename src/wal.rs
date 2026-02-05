@@ -1,7 +1,9 @@
+use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
+use crate::memtable::{MemTable, put};
 use crate::types::DBError;
 
 #[derive(Debug, Clone, Copy)]
@@ -16,10 +18,11 @@ pub struct WAL {
     buf: BufWriter<File>,
     pathBuf: PathBuf,
     sync: SyncPolicy,
+    max_record_len: u32,
 }
 
 impl WAL {
-    pub fn new(file_path: PathBuf, sync: SyncPolicy) -> Result<Self, DBError> {
+    pub fn new(file_path: PathBuf, sync: SyncPolicy, max_record_len: u32) -> Result<Self, DBError> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -35,6 +38,7 @@ impl WAL {
             buf: BufWriter::new(file),
             pathBuf: file_path,
             sync: sync,
+            max_record_len,
         })
     }
 
@@ -72,6 +76,87 @@ impl WAL {
 
         Ok(())
     }
+    
+    /// Loads all the contents of the WAL file into the `mem_table`. Prefer this over `read_all`
+    /// during DB reload as it will load files at best effort, if it encounters corruption, at least
+    /// the memtable will contain the requisite records.
+    pub fn replay_into(&mut self, wal_file: File, mem_table: &mut MemTable) -> Result<(), DBError> {
+        let mut buf = Vec::new();
+        let mut buf_reader = BufReader::new(wal_file);
+        
+        let num_bytes  = buf_reader.read_to_end(&mut buf)
+            .map_err(|e| {
+                DBError::Io { op: "failed to read_to_end", path: PathBuf::new(),  source: e }
+            })?;
+        
+        // decode data and load into mem_table
+        let mut offset = 0;
+        while offset < num_bytes {
+            match decode_record(&buf, offset, self.max_record_len) {
+                Ok((record, new_offset)) => {
+                    put(mem_table, record.key, record.val, record.seq_no)?;
+                    offset = new_offset
+                },
+                Err(e) => {
+                    match  e {
+                        WalDecodeError::CleanEOF => {
+                            break
+                        },
+                        _ => {
+                            return Err(DBError::WAL { what: "failed decoding record", err: Some(Box::new(e)) })
+                        }
+                    }
+                }
+            }
+            
+        };
+        
+        Ok(())
+    }
+
+    pub fn read_all(&mut self, wal_file: File) -> Result<Vec<WALRecord>, WalDecodeError> {
+        let mut reader: BufReader<File> = BufReader::new(wal_file);
+
+        // TODO: Perf - use try_reserve
+        let mut buf: Vec<u8>  = Vec::new();
+
+        let num_bytes = reader.read_to_end(&mut buf)
+            .map_err(|e| {
+                WalDecodeError::Io { op: "failed to read_all", source: Some(e) }
+            })?;
+
+        if num_bytes == 0 {
+            return Ok(vec![])
+        }
+
+        // TODO: Perf - can we be smarter with the alloc here?
+        let mut records: Vec<WALRecord> = Vec::new();
+        let mut offset = 0;
+        
+        while offset < num_bytes {
+            match decode_record(buf.as_ref(), offset, self.max_record_len) {
+                Ok((rec, new_offset)) =>  {
+                    if new_offset <= offset {
+                        return Err(WalDecodeError::Corruption { what: "decoder made no progress", offset: Some(offset as u32) })
+                    }
+                    
+                    offset = new_offset;
+                    records.push(rec)
+                }
+                Err(WalDecodeError::CleanEOF) => {
+                    // Expected after crash
+                    break;
+                }
+                Err(WalDecodeError::Corruption { what: _, offset }) => {
+                    // Stop at last good record
+                    break;
+                }
+                Err(e @ WalDecodeError::Io { .. }) => return Err(e)
+            }
+        }
+
+        Ok(records)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +181,20 @@ impl WALRecord {
 #[derive(Debug)]
 pub enum WalDecodeError {
     CleanEOF,
-    Corruption(&'static str),
+    Io {op: &'static str, source: Option<io::Error>},
+    Corruption {what: &'static str, offset: Option<u32> },
+}
+
+impl std::error::Error for WalDecodeError {}
+
+impl Display for WalDecodeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalDecodeError::CleanEOF => write!(f, "CleanEOF"),
+            WalDecodeError::Io { op, source } => write!(f, "op: {op:?} - source: {source:?}"),
+            WalDecodeError::Corruption {what, offset} => write!(f, "{what:?} - offset: {offset:?}")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +210,7 @@ impl TryFrom<u8> for Op {
         match val {
             0x1 => Ok(Op::Put),
             0x2 => Ok(Self::Delete),
-            _ => Err(WalDecodeError::Corruption("invalid op code found")),
+            _ => Err(WalDecodeError::Corruption{what: "invalid op code found", offset: None}),
         }
     }
 }
@@ -164,7 +262,7 @@ pub fn decode_record(
     // [len u32][op u8][seq u64][key_len u32][val_len u32][key bytes][val bytes]
     let len = read_u32_le(&buf[offset..]).ok_or(WalDecodeError::CleanEOF)?;
     if len == 0 || len > max_record_len {
-        return Err(WalDecodeError::Corruption("invalid len"));
+        return Err(WalDecodeError::Corruption{what: "invalid len", offset: Some(offset as u32) });
     }
 
     let total = (4 as usize) + len as usize;
@@ -181,33 +279,33 @@ pub fn decode_record(
 
     // If the start->end is less than at least the `rest_of_body+crc`, our record is too short;
     if rest_of_buf.len() < 4 {
-        return Err(WalDecodeError::Corruption("record too short"));
+        return Err(WalDecodeError::Corruption{what: "record too short", offset: Some(offset as u32) });
     }
 
     let body_len = rest_of_buf.len() - 4;
     let body = &rest_of_buf[..body_len];
     let crc_expecteed =
-        read_u32_le(&rest_of_buf[body_len..]).ok_or(WalDecodeError::Corruption("missing crc"))?;
+        read_u32_le(&rest_of_buf[body_len..]).ok_or(WalDecodeError::Corruption{what: "missing crc", offset: Some(offset as u32) })?;
     let crc_actual = crc32fast::hash(body);
     if crc_actual != crc_expecteed {
-        return Err(WalDecodeError::Corruption("crc mismatch"));
+        return Err(WalDecodeError::Corruption{what: "crc mismatch", offset: Some(offset as u32) });
     }
 
     //  compute the crchash first to see bits are still valid
     //
     if body.len() < 1 + 8 + 4 + 4 {
-        return Err(WalDecodeError::Corruption("body too short"));
+        return Err(WalDecodeError::Corruption{what: "body too short", offset: Some(offset as u32) });
     }
 
     let op = body[0];
-    let seq_no = read_u64_le(&body[1..]).ok_or(WalDecodeError::Corruption("bad seq"))?;
+    let seq_no = read_u64_le(&body[1..]).ok_or(WalDecodeError::Corruption{what: "bad seq", offset: Some(offset as u32) })?;
     let key_len =
-        read_u32_le(&body[1 + 8..]).ok_or(WalDecodeError::Corruption("bad seq"))? as usize;
+        read_u32_le(&body[1 + 8..]).ok_or(WalDecodeError::Corruption{what: "bad seq", offset: Some(offset as u32) })? as usize;
     let val_len =
-        read_u32_le(&body[1 + 8 + 4..]).ok_or(WalDecodeError::Corruption("bad seq"))? as usize;
+        read_u32_le(&body[1 + 8 + 4..]).ok_or(WalDecodeError::Corruption{what: "bad seq", offset: Some(offset as u32) })? as usize;
 
     if key_len == 0 {
-        return Err(WalDecodeError::Corruption("key_len is 0"));
+        return Err(WalDecodeError::Corruption{what: "key_len is 0", offset: Some(offset as u32) })
     }
 
     // Now we grab the [key:?][body:?]
@@ -215,9 +313,7 @@ pub fn decode_record(
     let expected_body_size = payload_offset + key_len + val_len;
 
     if expected_body_size != body.len() {
-        return Err(WalDecodeError::Corruption(
-            "length mismatch - body len doesnt match what is described in payload metadata",
-        ));
+        return Err(WalDecodeError::Corruption{what: "length mismatch - body len doesnt match what is described in payload metadata", offset: Some(offset as u32) });
     }
 
     // half-open i.e body[0..n)
@@ -250,8 +346,8 @@ fn read_u64_le(input: &[u8]) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod test {
-    use crate::wal::{Op, WALRecord, encode_record, decode_record};
+mod wal_test {
+    use crate::wal::{Op, WALRecord, decode_record, encode_record};
 
     #[test]
     fn test_enc_dec() {

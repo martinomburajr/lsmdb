@@ -1,15 +1,15 @@
 use crate::entry::Entry;
-use crate::types::{DBError, Decode, ERR_CONFIG_EMPTY_KEY, Encode};
-use std::collections::{BTreeMap, HashMap};
+use crate::types::{DBError, ERR_CONFIG_EMPTY_KEY};
+use std::collections::{BTreeMap};
 
-pub trait MemTableExt {
-    fn get(&self, key: &[u8]) -> Option<&Entry>;
-    fn put(&mut self, key: Vec<u8>, val: Vec<u8>, seq_no: u64);
-    fn delete(&mut self, key: Vec<u8>, seq_no: u64);
-    // TODO:
-    // fn iter();
-    // fn range();
-}
+// pub trait MemTableExt {
+//     fn get(&self, key: &[u8]) -> Option<&Entry>;
+//     fn put(&mut self, key: Vec<u8>, val: Vec<u8>, seq_no: u64);
+//     fn delete(&mut self, key: Vec<u8>, seq_no: u64);
+//     // TODO:
+//     // fn iter();
+//     // fn range();
+// }
 
 pub type MemTable = BTreeMap<Vec<u8>, Entry>;
 
@@ -41,7 +41,7 @@ pub fn put(mem: &mut MemTable, key: Vec<u8>, val: Vec<u8>, seq_no: u64) -> Resul
 #[cfg(test)]
 mod memtable {
     use super::*;
-    
+
     #[test]
     fn insert_and_get() {
         let mut mem = MemTable::new();
@@ -63,7 +63,7 @@ mod memtable {
 
         // Add Next Key
         {
-            let key_2= "key-2".to_string().into_bytes();
+            let key_2 = "key-2".to_string().into_bytes();
             let val_2 = "some-val_2".to_string().into_bytes();
 
             put(&mut mem, key_2.clone(), val_2.clone(), 1).unwrap();
@@ -79,5 +79,4 @@ mod memtable {
             )
         }
     }
-
 }

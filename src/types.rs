@@ -25,6 +25,10 @@ pub enum DBError {
         path: PathBuf,
         offset: u64,
     },
+    WAL {
+        what: &'static str,
+        err: Option<Box <dyn std::error::Error + Send + Sync + 'static>>,
+    },
     Codec {
         context: String,
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
@@ -54,6 +58,9 @@ impl Display for DBError {
             }
             DBError::InvalidConfig { what } => {
                 write!(f, "what: {what}")
+            }
+            DBError::WAL { what, err } => {
+                write!(f, "what: {what:?} - err: {err:?}")
             }
         }
     }
